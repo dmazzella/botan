@@ -106,12 +106,17 @@ std::unique_ptr<PasswordHashFamily> PasswordHashFamily::create(std::string_view 
 
 #if defined(BOTAN_HAS_PKCS12_KDF)
    if(req.algo_name() == "PKCS12-KDF" && req.arg_count() == 2) {
-      if(HashFunction::create(req.arg(0))) {
+      // The PKCS#12 KDF needs the hash's block size (RFC 7292 'v'); reject hashes
+      // that don't expose one rather than letting derive_key throw later.
+      if(auto hash = HashFunction::create(req.arg(0))) {
+         if(hash->hash_block_size() == 0) {
+            return nullptr;
+         }
          const auto id_param = req.arg_as_integer(1);
          if(id_param < 1 || id_param > 3) {
             return nullptr;
          }
-         return std::make_unique<PKCS12_KDF_Family>(req.arg(0), static_cast<uint8_t>(id_param));
+         return std::make_unique<PKCS12_KDF_Family>(std::move(hash), static_cast<uint8_t>(id_param));
       }
    }
 #endif

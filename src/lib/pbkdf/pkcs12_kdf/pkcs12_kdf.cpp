@@ -56,41 +56,42 @@ secure_vector<uint8_t> pkcs12_encode_password(std::string_view password) {
    if(password.empty()) {
       return secure_vector<uint8_t>({0, 0});
    }
-   const std::vector<uint8_t> ucs2 = utf8_to_ucs2(std::string(password));
+
+   std::vector<uint8_t> ucs2 = utf8_to_ucs2(password);
    secure_vector<uint8_t> result(ucs2.begin(), ucs2.end());
+   clear_mem(ucs2);
    result.push_back(0);
    result.push_back(0);
    return result;
 }
 
-void pkcs12_kdf(uint8_t out[],
-                size_t out_len,
-                std::span<const uint8_t> pwd_bytes,
-                const uint8_t salt[],
-                size_t salt_len,
-                size_t iterations,
-                uint8_t id,
-                std::string_view hash_algo) {
+namespace {
+
+void pkcs12_kdf_with_hash(uint8_t out[],
+                          size_t out_len,
+                          std::span<const uint8_t> pwd_bytes,
+                          const uint8_t salt[],
+                          size_t salt_len,
+                          size_t iterations,
+                          uint8_t id,
+                          HashFunction& hash) {
    if(iterations == 0) {
-      throw Invalid_Argument("PKCS12 KDF: Invalid iteration count");
+      throw Invalid_Argument("PKCS12-KDF: Invalid iteration count");
    }
    if(id < 1 || id > 3) {
-      throw Invalid_Argument("PKCS12 KDF: Invalid id (must be 1=key, 2=IV, or 3=MAC)");
+      throw Invalid_Argument("PKCS12-KDF: Invalid id (must be 1=key, 2=IV, or 3=MAC)");
    }
-
-   clear_mem(std::span{out, out_len});
 
    if(out_len == 0) {
       return;
    }
 
-   auto hash = HashFunction::create_or_throw(hash_algo);
-   const size_t hash_len = hash->output_length();
+   const size_t hash_len = hash.output_length();
 
    // Block size depends on hash algorithm (RFC 7292 uses the hash's block size as v)
-   const size_t v = hash->hash_block_size();
+   const size_t v = hash.hash_block_size();
    if(v == 0) {
-      throw Invalid_Argument(fmt("PKCS12 KDF does not support hash '{}': undefined block size", hash_algo));
+      throw Invalid_Argument(fmt("PKCS12-KDF does not support hash '{}': undefined block size", hash.name()));
    }
 
    const size_t pwd_len = pwd_bytes.size();
@@ -118,13 +119,13 @@ void pkcs12_kdf(uint8_t out[],
    size_t out_offset = 0;
    while(out_offset < out_len) {
       // Compute A = H^iterations(D || I)
-      hash->update(D);
-      hash->update(I);
-      hash->final(A);
+      hash.update(D);
+      hash.update(I);
+      hash.final(A);
 
       for(size_t iter = 1; iter < iterations; ++iter) {
-         hash->update(A);
-         hash->final(A);
+         hash.update(A);
+         hash.final(A);
       }
 
       // Copy to output
@@ -142,14 +143,29 @@ void pkcs12_kdf(uint8_t out[],
    }
 }
 
-PKCS12_KDF::PKCS12_KDF(std::string hash_name, uint8_t id, size_t iterations) :
-      m_hash_name(std::move(hash_name)), m_id(id), m_iterations(iterations) {
-   BOTAN_ARG_CHECK(m_iterations > 0, "PKCS12_KDF: iterations must be greater than zero");
-   BOTAN_ARG_CHECK(m_id >= 1 && m_id <= 3, "PKCS12_KDF: id must be 1 (key), 2 (IV), or 3 (MAC)");
+}  // namespace
+
+void pkcs12_kdf(uint8_t out[],
+                size_t out_len,
+                std::span<const uint8_t> pwd_bytes,
+                const uint8_t salt[],
+                size_t salt_len,
+                size_t iterations,
+                uint8_t id,
+                std::string_view hash_algo) {
+   auto hash = HashFunction::create_or_throw(hash_algo);
+   pkcs12_kdf_with_hash(out, out_len, pwd_bytes, salt, salt_len, iterations, id, *hash);
+}
+
+PKCS12_KDF::PKCS12_KDF(std::unique_ptr<HashFunction> hash, uint8_t id, size_t iterations) :
+      m_hash(std::move(hash)), m_id(id), m_iterations(iterations) {
+   BOTAN_ARG_CHECK(m_hash != nullptr, "PKCS12-KDF: hash must not be null");
+   BOTAN_ARG_CHECK(m_iterations > 0, "PKCS12-KDF: iterations must be greater than zero");
+   BOTAN_ARG_CHECK(m_id >= 1 && m_id <= 3, "PKCS12-KDF: id must be 1 (key), 2 (IV), or 3 (MAC)");
 }
 
 std::string PKCS12_KDF::to_string() const {
-   return fmt("PKCS12-KDF({},{},{})", m_hash_name, static_cast<unsigned>(m_id), m_iterations);
+   return fmt("PKCS12-KDF({},{},{})", m_hash->name(), static_cast<unsigned>(m_id), m_iterations);
 }
 
 void PKCS12_KDF::derive_key(uint8_t out[],
@@ -160,15 +176,17 @@ void PKCS12_KDF::derive_key(uint8_t out[],
                             size_t salt_len) const {
    const std::string_view pwd =
       (password != nullptr && password_len > 0) ? std::string_view(password, password_len) : std::string_view{};
-   pkcs12_kdf(out, out_len, pkcs12_encode_password(pwd), salt, salt_len, m_iterations, m_id, m_hash_name);
+   pkcs12_kdf_with_hash(out, out_len, pkcs12_encode_password(pwd), salt, salt_len, m_iterations, m_id, *m_hash);
 }
 
-PKCS12_KDF_Family::PKCS12_KDF_Family(std::string hash_name, uint8_t id) : m_hash_name(std::move(hash_name)), m_id(id) {
-   BOTAN_ARG_CHECK(m_id >= 1 && m_id <= 3, "PKCS12_KDF: id must be 1 (key), 2 (IV), or 3 (MAC)");
+PKCS12_KDF_Family::PKCS12_KDF_Family(std::unique_ptr<HashFunction> hash, uint8_t id) :
+      m_hash(std::move(hash)), m_id(id) {
+   BOTAN_ARG_CHECK(m_hash != nullptr, "PKCS12-KDF: hash must not be null");
+   BOTAN_ARG_CHECK(m_id >= 1 && m_id <= 3, "PKCS12-KDF: id must be 1 (key), 2 (IV), or 3 (MAC)");
 }
 
 std::string PKCS12_KDF_Family::name() const {
-   return fmt("PKCS12-KDF({},{})", m_hash_name, static_cast<unsigned>(m_id));
+   return fmt("PKCS12-KDF({},{})", m_hash->name(), static_cast<unsigned>(m_id));
 }
 
 std::unique_ptr<PasswordHash> PKCS12_KDF_Family::tune_params(size_t output_length,
@@ -186,15 +204,16 @@ std::unique_ptr<PasswordHash> PKCS12_KDF_Family::tune_params(size_t output_lengt
       pkcs12_encode_password(std::string_view(reinterpret_cast<const char*>(tuning_pwd.data()), tuning_pwd.size()));
    std::vector<uint8_t> tuning_out(tuning_out_len);
 
+   auto tuning_hash = m_hash->new_object();
    const uint64_t measured_nsec = measure_cost(tuning_msec, [&]() {
-      pkcs12_kdf(tuning_out.data(),
-                 tuning_out.size(),
-                 pwd_bytes,
-                 tuning_salt.data(),
-                 tuning_salt.size(),
-                 tuning_iterations,
-                 m_id,
-                 m_hash_name);
+      pkcs12_kdf_with_hash(tuning_out.data(),
+                           tuning_out.size(),
+                           pwd_bytes,
+                           tuning_salt.data(),
+                           tuning_salt.size(),
+                           tuning_iterations,
+                           m_id,
+                           *tuning_hash);
    });
 
    // Scale: one benchmark sample = tuning_iterations iterations; target matches desired_msec.
@@ -204,19 +223,19 @@ std::unique_ptr<PasswordHash> PKCS12_KDF_Family::tune_params(size_t output_lengt
    const double est_clamped = std::clamp(est, 1.0, static_cast<double>(std::numeric_limits<size_t>::max()));
    const size_t iterations = static_cast<size_t>(est_clamped);
 
-   return std::make_unique<PKCS12_KDF>(m_hash_name, m_id, iterations);
+   return std::make_unique<PKCS12_KDF>(m_hash->new_object(), m_id, iterations);
 }
 
 std::unique_ptr<PasswordHash> PKCS12_KDF_Family::default_params() const {
-   return std::make_unique<PKCS12_KDF>(m_hash_name, m_id, 2048);
+   return std::make_unique<PKCS12_KDF>(m_hash->new_object(), m_id, 2048);
 }
 
 std::unique_ptr<PasswordHash> PKCS12_KDF_Family::from_iterations(size_t iterations) const {
-   return std::make_unique<PKCS12_KDF>(m_hash_name, m_id, iterations);
+   return std::make_unique<PKCS12_KDF>(m_hash->new_object(), m_id, iterations);
 }
 
 std::unique_ptr<PasswordHash> PKCS12_KDF_Family::from_params(size_t i1, size_t /*i2*/, size_t /*i3*/) const {
-   return std::make_unique<PKCS12_KDF>(m_hash_name, m_id, i1);
+   return std::make_unique<PKCS12_KDF>(m_hash->new_object(), m_id, i1);
 }
 
 }  // namespace Botan

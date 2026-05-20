@@ -1,5 +1,10 @@
 # PKCS#12 KDF Test Vectors
-# Per RFC 7292 Appendix B
+#
+# SHA-1 vectors are taken from RFC 7292 Appendix B.4 (the only digest
+# enumerated by the RFC). SHA-256 vectors are not part of any IETF spec;
+# they were generated with an independent reference implementation
+# (Bouncy Castle org.bouncycastle.crypto.generators.PKCS12ParametersGenerator
+# configured with SHA-256) and cross-checked against OpenSSL's PKCS12_key_gen_uni.
 #
 # Section header encodes algo spec: PKCS12-KDF(hash,id)
 #   id 1 = encryption key, 2 = IV, 3 = MAC key
